@@ -1,102 +1,140 @@
 import requests
 import time
+from typing import Optional
 from deep_translator import GoogleTranslator
 from langdetect import detect, LangDetectException
+import pandas as pd
+import os
 
-HUGGINGFACE_TOKEN = ""
-API_URL = "https://api-inference.huggingface.co/models/sarvamai/sarvam-m"
-HEADERS = {
-    "Authorization": f"Bearer {HUGGINGFACE_TOKEN}",
-    "Content-Type": "application/json"
+# Sarvam API constants
+SARVAM_API_KEY = "sk_zdw93n1y_8xmrHBp5glmO0TcpL8JZY8aF"
+SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions"
+
+REPEAT_RUNS = 10
+EXCEL_FILENAME = "sarvam_latency_metrics.xlsx"
+
+LANGUAGE_MAP = {
+    'hi': 'Hindi', 'bn': 'Bengali', 'ta': 'Tamil', 'te': 'Telugu',
+    'ml': 'Malayalam', 'kn': 'Kannada', 'mr': 'Marathi', 'gu': 'Gujarati',
+    'pa': 'Punjabi', 'or': 'Odia', 'en': 'English'
 }
 
-def translate_to_english(text):
-    start_time = time.time()
-    result = GoogleTranslator(source='auto', target='en').translate(text)
-    latency = time.time() - start_time
-    return result, latency
+def detect_language(text: str) -> Optional[str]:
+    try:
+        return detect(text)
+    except LangDetectException:
+        return None
 
-def translate_to_language(text, target_lang_code):
-    start_time = time.time()
-    result = GoogleTranslator(source='auto', target=target_lang_code).translate(text)
-    latency = time.time() - start_time
-    return result, latency
+def translate_to_english(text: str, source_lang: str) -> (str, float):
+    start = time.time()
+    translated = GoogleTranslator(source=source_lang, target='en').translate(text)
+    end = time.time()
+    return translated, (end - start) * 1000
 
-def query_sarvam(prompt):
+def translate_back(text: str, target_lang: str) -> (str, float):
+    max_chunk_size = 4500
+    chunks = [text[i:i + max_chunk_size] for i in range(0, len(text), max_chunk_size)]
+    start = time.time()
+    translated_parts = [
+        GoogleTranslator(source='en', target=target_lang).translate(chunk)
+        for chunk in chunks
+    ]
+    end = time.time()
+    return ' '.join(translated_parts), (end - start) * 1000
+
+def get_sarvam_response(prompt: str, api_key: str) -> (str, float):
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
     payload = {
-        "inputs": prompt,
-        "parameters": {
-            "do_sample": True,
-            "temperature": 0.7,
-            "top_k": 50,
-            "top_p": 0.95,
-            "max_new_tokens": 512
-        }
+        "model": "sarvam-m",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.7
     }
 
-    start_time = time.time()
-    response = requests.post(API_URL, headers=HEADERS, json=payload)
-    latency = time.time() - start_time
-    response.raise_for_status()
+    start = time.time()
+    response = requests.post(SARVAM_API_URL, headers=headers, json=payload)
+    end = time.time()
 
-    output = response.json()
-    if isinstance(output, list) and "generated_text" in output[0]:
-        return output[0]["generated_text"], latency
-    else:
-        raise ValueError("Unexpected response from Hugging Face API")
+    try:
+        result = response.json()
+    except ValueError:
+        return "[Error parsing response]", (end - start) * 1000
 
-def run_batch_tests():
-    prompts = {
-        "bn": "জলবায়ু পরিবর্তন কী?",
-        "gu": "હવામાનમાં ફેરફાર શું છે?",
-        "hi": "जलवायु परिवर्तन क्या है?",
-        "kn": "ಹವಾಮಾನ ಬದಲಾವಣೆ ಎಂದರೇನು?",
-        "mr": "हवामान बदल म्हणजे काय?",
-        "ml": "കാലാവസ്ഥ മാറ്റം എന്താണ്?",
-        "or": "ପରିବେଶ ପରିବର୍ତ୍ତନ କଣ?",
-        "pa": "ਮੌਸਮ ਵਿੱਚ ਤਬਦੀਲੀ ਕੀ ਹੈ?",
-        "ta": "காலநிலை மாற்றம் என்பது என்ன?",
-        "te": "వాతావరణ మార్పు అంటే ఏమిటి?"
+    if response.status_code != 200:
+        return f"[Error {response.status_code}: {result.get('error', {}).get('message', response.text)}]", (end - start) * 1000
+
+    try:
+        return result['choices'][0]['message']['content'].strip(), (end - start) * 1000
+    except (KeyError, IndexError):
+        return "[Unexpected response format]", (end - start) * 1000
+
+def log_to_excel(data: list, filename: str = EXCEL_FILENAME):
+    df = pd.DataFrame(data)
+
+    # Calculate mean values and append as a new row
+    mean_row = {
+        "Run": "Mean",
+        "Input Language": df["Input Language"].iloc[0],
+        "Prompt Length": round(df["Prompt Length"].mean(), 2),
+        "LLM Response Length": round(df["LLM Response Length"].mean(), 2),
+        "To English Latency (ms)": round(df["To English Latency (ms)"].mean(), 2),
+        "LLM Inference Latency (ms)": round(df["LLM Inference Latency (ms)"].mean(), 2),
+        "To Native Latency (ms)": round(df["To Native Latency (ms)"].mean(), 2)
     }
 
-    for lang_code, prompt in prompts.items():
-        print(f"\n\n=== Testing Language: {lang_code.upper()} ===")
-        print(f"Original Prompt: {prompt}")
+    df = pd.concat([df, pd.DataFrame([mean_row])], ignore_index=True)
 
-        
-        try:
-            detected_lang = detect(prompt)
-        except LangDetectException:
-            detected_lang = lang_code
-            print(f"Could not auto-detect language. Defaulting to: {lang_code}")
+    if os.path.exists(filename):
+        existing_df = pd.read_excel(filename)
+        df = pd.concat([existing_df, df], ignore_index=True)
 
-        
-        english_prompt, to_en_latency = translate_to_english(prompt)
-        print(f"\n→ English_1 (Translated Prompt): {english_prompt}")
-        print(f"Translation to English latency: {to_en_latency:.3f} sec")
-
-        
-        print("\nSending prompt to Sarvam-M...")
-        sarvam_response, llm_latency = query_sarvam(english_prompt)
-        print(f"Sarvam-M inference latency: {llm_latency:.3f} sec")
-        print("\n→ Sarvam-M's Response (English):")
-        print(sarvam_response)
-
-        
-        final_response, back_to_lang_latency = translate_to_language(sarvam_response, detected_lang)
-        print(f"\n← Translated back to {lang_code}: {final_response}")
-        print(f"Back translation latency: {back_to_lang_latency:.3f} sec")
-
-        
-        english_round_trip, round_trip_latency = translate_to_english(final_response)
-        print(f"\n⇌ English_2 (Round-Trip): {english_round_trip}")
-        print(f"Round-trip translation to English latency: {round_trip_latency:.3f} sec")
-
-        
-        print("\n=== Comparison of English Translations ===")
-        print(f"English_1: {english_prompt}")
-        print(f"English_2: {english_round_trip}")
-        print("==========================================")
+    df.to_excel(filename, index=False)
 
 if __name__ == "__main__":
-    run_batch_tests()
+    user_input = input("Enter your prompt in any Indian language: ")
+
+    lang_code = detect_language(user_input)
+    if lang_code is None:
+        print("Could not detect language.")
+        exit()
+
+    lang_name = LANGUAGE_MAP.get(lang_code, lang_code)
+    print(f"\nDetected Language: {lang_name} ({lang_code})")
+
+    log_data = []
+
+    for run in range(REPEAT_RUNS):
+        print(f"\n--- Run {run + 1} ---")
+
+        # Native to English
+        translated_english, latency_to_english = translate_to_english(user_input, lang_code)
+        print(f"Translated to English: {translated_english} (Latency: {latency_to_english:.2f} ms)")
+
+        # LLM response
+        sarvam_output_english, sarvam_latency = get_sarvam_response(translated_english, SARVAM_API_KEY)
+        print(f"Sarvam Response: {sarvam_output_english} (Latency: {sarvam_latency:.2f} ms)")
+
+        # English to Native
+        translated_back, latency_to_native = translate_back(sarvam_output_english, lang_code)
+        print(f"Back Translated: {translated_back} (Latency: {latency_to_native:.2f} ms)")
+
+        # Record data
+        log_data.append({
+            "Run": run + 1,
+            "Input Language": lang_name,
+            "Prompt Length": len(user_input),
+            "LLM Response Length": len(sarvam_output_english),
+            "To English Latency (ms)": round(latency_to_english, 2),
+            "LLM Inference Latency (ms)": round(sarvam_latency, 2),
+            "To Native Latency (ms)": round(latency_to_native, 2)
+        })
+
+    log_to_excel(log_data)
+    print(f"\nAll {REPEAT_RUNS} runs completed. Metrics saved to '{EXCEL_FILENAME}'.")
+
