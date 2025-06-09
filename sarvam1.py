@@ -5,12 +5,13 @@ from deep_translator import GoogleTranslator
 from langdetect import detect, LangDetectException
 import pandas as pd
 import os
+from rouge_score import rouge_scorer
 
 SARVAM_API_KEY = "sk_zdw93n1y_8xmrHBp5glmO0TcpL8JZY8aF"
 SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions"
 
-REPEAT_RUNS = 3  
-EXCEL_FILENAME = "sarvam_latency_metrics1.xlsx"
+REPEAT_RUNS = 3
+EXCEL_FILENAME = "sarvam_latency_metrics_with_rouge.xlsx"
 
 LANGUAGE_MAP = {
     'hi': 'Hindi', 'ta': 'Tamil', 'te': 'Telugu'
@@ -97,7 +98,6 @@ def get_sarvam_response(prompt: str, api_key: str) -> (str, float):
 def log_to_excel(data: list, filename: str = EXCEL_FILENAME):
     df = pd.DataFrame(data)
 
-    # Calculate mean values and append as a new row
     mean_row = {
         "Run": "Mean",
         "Prompt": df["Prompt"].iloc[0],
@@ -107,7 +107,10 @@ def log_to_excel(data: list, filename: str = EXCEL_FILENAME):
         "LLM Response Length": round(df["LLM Response Length"].mean(), 2),
         "To English Latency (ms)": round(df["To English Latency (ms)"].mean(), 2),
         "LLM Inference Latency (ms)": round(df["LLM Inference Latency (ms)"].mean(), 2),
-        "To Native Latency (ms)": round(df["To Native Latency (ms)"].mean(), 2)
+        "To Native Latency (ms)": round(df["To Native Latency (ms)"].mean(), 2),
+        "ROUGE-1 F1": round(df.get("ROUGE-1 F1", pd.Series([0])).mean(), 4),
+        "ROUGE-2 F1": round(df.get("ROUGE-2 F1", pd.Series([0])).mean(), 4),
+        "ROUGE-L F1": round(df.get("ROUGE-L F1", pd.Series([0])).mean(), 4)
     }
 
     df = pd.concat([df, pd.DataFrame([mean_row])], ignore_index=True)
@@ -119,6 +122,7 @@ def log_to_excel(data: list, filename: str = EXCEL_FILENAME):
     df.to_excel(filename, index=False)
 
 if __name__ == "__main__":
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
     all_results = []
 
     for q_type, lang_prompts in PROMPT_TYPES.items():
@@ -131,15 +135,10 @@ if __name__ == "__main__":
                 print(f"\n--- Run {run + 1} ---")
 
                 translated_english, latency_to_english = translate_to_english(native_prompt, lang_code)
-                print(f"To English: {translated_english} ({latency_to_english:.2f} ms)")
-
                 sarvam_output_english, sarvam_latency = get_sarvam_response(translated_english, SARVAM_API_KEY)
-                print(f"Sarvam: {sarvam_output_english} ({sarvam_latency:.2f} ms)")
-
                 translated_back, latency_to_native = translate_back(sarvam_output_english, lang_code)
-                print(f"Back Translation: {translated_back} ({latency_to_native:.2f} ms)")
 
-                run_results.append({
+                result = {
                     "Run": run + 1,
                     "Prompt": native_prompt,
                     "Question Type": q_type,
@@ -149,9 +148,19 @@ if __name__ == "__main__":
                     "To English Latency (ms)": round(latency_to_english, 2),
                     "LLM Inference Latency (ms)": round(sarvam_latency, 2),
                     "To Native Latency (ms)": round(latency_to_native, 2)
-                })
+                }
+
+                if q_type == "Summarization":
+                    scores = scorer.score(native_prompt, translated_back)
+                    result["ROUGE-1 F1"] = round(scores['rouge1'].fmeasure, 4)
+                    result["ROUGE-2 F1"] = round(scores['rouge2'].fmeasure, 4)
+                    result["ROUGE-L F1"] = round(scores['rougeL'].fmeasure, 4)
+                    print(f"ROUGE-1: {result['ROUGE-1 F1']}, ROUGE-2: {result['ROUGE-2 F1']}, ROUGE-L: {result['ROUGE-L F1']}")
+
+                run_results.append(result)
 
             log_to_excel(run_results)
             all_results.extend(run_results)
 
     print(f"\nAll prompt types and languages completed. Results saved in '{EXCEL_FILENAME}'.")
+
